@@ -31,13 +31,29 @@ def default_paths():
     }
 
 def load_pipeline_or_parts(pipeline_path: Path, model_path: Path, vectorizer_path: Path):
+    """Attempt to load pipeline, model and vectorizer. Return a tuple
+    (pipeline_or_none, clf_or_none, vec_or_none). Each component is loaded
+    independently if the corresponding file exists.
+    """
+    pipe = None
+    clf = None
+    vec = None
     if pipeline_path and pipeline_path.exists():
-        return joblib.load(pipeline_path), None, None
-    if model_path.exists() and vectorizer_path.exists():
-        clf = joblib.load(model_path)
-        vec = joblib.load(vectorizer_path)
-        return None, clf, vec
-    return None, None, None
+        try:
+            pipe = joblib.load(pipeline_path)
+        except Exception:
+            pipe = None
+    if model_path.exists():
+        try:
+            clf = joblib.load(model_path)
+        except Exception:
+            clf = None
+    if vectorizer_path.exists():
+        try:
+            vec = joblib.load(vectorizer_path)
+        except Exception:
+            vec = None
+    return pipe, clf, vec
 
 
 def detect_text_column(df: pd.DataFrame) -> str:
