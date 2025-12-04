@@ -2,7 +2,10 @@
 import argparse
 from pathlib import Path
 import re
+import io
 import joblib
+import pandas as pd
+from PIL import Image
 import streamlit as st
 
 # ---------- text cleaning ----------
@@ -36,6 +39,27 @@ def load_pipeline_or_parts(pipeline_path: Path, model_path: Path, vectorizer_pat
         return None, clf, vec
     return None, None, None
 
+
+def detect_text_column(df: pd.DataFrame) -> str:
+    candidates = [c for c in ["combined_text", "text", "content", "article", "body", "headline", "title"] if c in df.columns]
+    if candidates:
+        return candidates[0]
+    # fallback: first object/string column
+    for c in df.columns:
+        if pd.api.types.is_string_dtype(df[c]):
+            return c
+    # otherwise just return the first column
+    return df.columns[0]
+
+
+def predict_texts(texts, pipe, clf, vec):
+    if pipe is not None:
+        probs = pipe.predict_proba(texts)[:, 1]
+    else:
+        X = vec.transform(texts)
+        probs = clf.predict_proba(X)[:, 1]
+    return probs
+
 # ---------- streamlit app ----------
 def main():
     # parse CLI overrides but give safe defaults relative to repo root
@@ -51,9 +75,9 @@ def main():
     model_path = Path(args.model).resolve()
     vectorizer_path = Path(args.vectorizer).resolve()
 
-    st.set_page_config(page_title="Fake News Detector", page_icon="📰", layout="centered")
-    st.title("📰 Fake News & Misinformation Detector")
-    st.caption("TF-IDF + Logistic Regression (interpretable)")
+    st.set_page_config(page_title="Fake News Detector", layout="centered")
+    st.title("Fake News & Misinformation Detector")
+    st.caption("TF-IDF + RandomForest (TF-IDF pipeline) — batch predictions & charts")
 
     # sidebar: show where we look for files
     with st.sidebar:
@@ -73,21 +97,71 @@ def main():
         )
         st.stop()
 
-    txt = st.text_area("Paste headline or article text:", height=200)
-    threshold = st.slider("FAKE decision threshold", 0.05, 0.95, 0.50, 0.01)
+    # Model selection (if multiple artifact options available)
+    model_options = []
+    if pipeline_path.exists():
+        model_options.append("pipeline")
+    if model_path.exists() and vectorizer_path.exists():
+        model_options.append("model+vectorizer")
+    chosen = st.sidebar.selectbox("Model to use", model_options, index=0 if model_options else None)
 
+    # Decision threshold
+    threshold = st.sidebar.slider("FAKE decision threshold", 0.01, 0.99, 0.50, 0.01)
+
+    st.header("Single text analysis")
+    txt = st.text_area("Paste headline or article text:", height=160)
     if st.button("Analyze") and txt.strip():
         s = clean_text(txt)
-        if pipe is not None:
-            prob_fake = float(pipe.predict_proba([s])[0, 1])
-        else:
-            X = vec.transform([s])
-            prob_fake = float(clf.predict_proba(X)[0, 1])
-
+        prob_fake = float(predict_texts([s], pipe if chosen == "pipeline" else None, clf if chosen == "model+vectorizer" else None, vec if chosen == "model+vectorizer" else None)[0])
         label = "FAKE" if prob_fake >= threshold else "REAL"
         st.metric("Prediction", label)
-        st.progress(prob_fake if label == "FAKE" else 1 - prob_fake,
-                    text=f"Fake probability: {prob_fake:.1%} (threshold {threshold:.2f})")
+        st.progress(int(prob_fake * 100))
+        st.write(f"Fake probability: {prob_fake:.1%} (threshold {threshold:.2f})")
+
+    st.markdown("---")
+    st.header("Batch predictions from CSV")
+    uploaded = st.file_uploader("Upload a CSV file for batch predictions", type=["csv"])
+    if uploaded is not None:
+        try:
+            df = pd.read_csv(uploaded)
+        except Exception:
+            uploaded.seek(0)
+            df = pd.read_csv(io.StringIO(uploaded.getvalue().decode("utf-8")))
+
+        st.write("Preview of uploaded data:")
+        st.dataframe(df.head())
+
+        text_col_default = detect_text_column(df)
+        text_col = st.selectbox("Text column to use for predictions", options=list(df.columns), index=list(df.columns).index(text_col_default))
+
+        if st.button("Run batch predictions"):
+            texts = df[text_col].fillna("").astype(str).map(clean_text).tolist()
+            probs = predict_texts(texts, pipe if chosen == "pipeline" else None, clf if chosen == "model+vectorizer" else None, vec if chosen == "model+vectorizer" else None)
+            df["fake_prob"] = probs
+            df["predicted"] = df["fake_prob"].apply(lambda p: "FAKE" if p >= threshold else "REAL")
+            st.write("Predictions (first 10):")
+            st.dataframe(df[[text_col, "fake_prob", "predicted"]].head(10))
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download predictions CSV", data=csv_bytes, file_name="predictions.csv", mime="text/csv")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("Evaluation charts")
+    charts_dir = project_root() / "outputs" / "charts"
+    if st.sidebar.checkbox("Show confusion / ROC / PR charts"):
+        cm_path = charts_dir / "confusion_matrix.png"
+        roc_path = charts_dir / "roc_curve.png"
+        pr_path = charts_dir / "pr_curve.png"
+        if cm_path.exists():
+            st.subheader("Confusion Matrix")
+            st.image(Image.open(cm_path), use_column_width=True)
+        else:
+            st.info("No confusion matrix found in outputs/charts/")
+        if roc_path.exists():
+            st.subheader("ROC Curve")
+            st.image(Image.open(roc_path), use_column_width=True)
+        if pr_path.exists():
+            st.subheader("Precision-Recall Curve")
+            st.image(Image.open(pr_path), use_column_width=True)
 
 if __name__ == "__main__":
     main()

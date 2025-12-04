@@ -13,27 +13,22 @@ import matplotlib.pyplot as plt
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-    roc_curve,
-    precision_recall_curve,
-    average_precision_score,
-)
+from sklearn.metrics import roc_curve, precision_recall_curve, confusion_matrix
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
+
+from utils import (
+    ensure_outdir,
+    save_json,
+    compute_classification_metrics,
+    plot_confusion_matrix,
+    plot_curve,
+)
 
 # -----------------------------
 # Helpers
 # -----------------------------
 LABELS: Final[Tuple[str, str]] = ("REAL", "FAKE")
-
-
-def ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def read_csv_any(path: Path, nrows: int | None = None) -> pd.DataFrame:
@@ -43,52 +38,10 @@ def read_csv_any(path: Path, nrows: int | None = None) -> pd.DataFrame:
         return pd.read_csv(path, nrows=nrows, encoding="latin-1")
 
 
-def pick_text_column(df: pd.DataFrame, preferred: str) -> str:
-    if preferred in df.columns:
-        return preferred
-    for alt in ("combined_text", "text", "content", "article", "body"):
-        if alt in df.columns:
-            return alt
-    # if still not found, try title-only as last resort
-    if "title" in df.columns:
-        return "title"
-    raise ValueError(
-        f"No suitable text column found. Available columns: {list(df.columns)[:20]}"
-    )
-
-
 # -----------------------------
 # Plot utilities
 # -----------------------------
-def plot_confusion_matrix(cm: np.ndarray, out: Path, title: str = "Confusion Matrix") -> None:
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(cm, interpolation="nearest")
-    ax.set_title(title)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(LABELS)
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(LABELS)
-
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, int(cm[i, j]), ha="center", va="center")
-
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-
-
-def plot_curve(x: np.ndarray, y: np.ndarray, out: Path, title: str, xlabel: str, ylabel: str) -> None:
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.plot(x, y)
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
+# plotting and metric helpers are provided by `src/utils.py`
 
 
 # -----------------------------
@@ -108,8 +61,8 @@ def main() -> None:
     ap.add_argument("--outdir", default="outputs", help="Output directory")
     a = ap.parse_args()
 
-    outdir = ensure_dir(Path(a.outdir))
-    charts = ensure_dir(outdir / "charts")
+    outdir = ensure_outdir(Path(a.outdir))
+    charts = ensure_outdir(outdir / "charts")
 
     # 1) Load data
     df_real = read_csv_any(Path(a.real))
@@ -125,8 +78,10 @@ def main() -> None:
     X = pd.concat([df_real["combined_text"], df_fake["combined_text"]], ignore_index=True)
     y = np.array([0] * len(df_real) + [1] * len(df_fake))  # 0=REAL, 1=FAKE
 
-    # 4) Train/Validation split
-    X_train, X_test, y_train, y_test = X, X, y, y
+    # 4) Train/Validation split (stratified hold-out)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=42
+    )
 
     # 5) Pipeline: TF-IDF (1–3 grams) + RandomForest
     pipe = Pipeline(
@@ -164,29 +119,36 @@ def main() -> None:
     pipe.fit(X_train, y_train)
 
     # 8) Evaluate on hold-out test split
-    y_prob = pipe.predict_proba(X_test)[:, 1]
-    y_pred = (y_prob >= 0.5).astype(int)
+    # 8) Evaluate on hold-out test split
+    if hasattr(pipe, "predict_proba"):
+        y_prob = pipe.predict_proba(X_test)[:, 1]
+    else:
+        # fallback: use decision_function if available
+        if hasattr(pipe, "decision_function"):
+            raw = pipe.decision_function(X_test)
+            # try to map to [0,1]
+            y_prob = (raw - raw.min()) / (raw.max() - raw.min())
+        else:
+            y_prob = None
 
-    metrics = {
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "roc_auc": float(roc_auc_score(y_test, y_prob)),
-        "avg_precision": float(average_precision_score(y_test, y_prob)),
-        "cv_f1_macro_mean": float(cv_f1.mean()),
-        "cv_f1_macro_std": float(cv_f1.std()),
-        "report": classification_report(y_test, y_pred, target_names=LABELS, output_dict=True),
-    }
+    y_pred = pipe.predict(X_test)
+
+    metrics = compute_classification_metrics(y_test, y_pred, y_prob=y_prob, target_names=LABELS)
+    metrics.update({"cv_f1_macro_mean": float(cv_f1.mean()), "cv_f1_macro_std": float(cv_f1.std())})
 
     # 9) Save metrics and figures
-    (outdir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    save_json(metrics, outdir / "metrics.json")
 
-    cm = confusion_matrix(y_test, y_pred)
-    plot_confusion_matrix(cm, charts / "confusion_matrix.png")
+    # confusion matrix image
+    cm = np.array(metrics["confusion_matrix"]) if isinstance(metrics.get("confusion_matrix"), list) else confusion_matrix(y_test, y_pred)
+    plot_confusion_matrix(np.asarray(cm), charts / "confusion_matrix.png", labels=LABELS)
 
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
-    plot_curve(fpr, tpr, charts / "roc_curve.png", "ROC Curve", "FPR", "TPR")
+    if y_prob is not None:
+        fpr, tpr, _ = roc_curve(y_test, y_prob)
+        plot_curve(fpr, tpr, charts / "roc_curve.png", "ROC Curve", "FPR", "TPR")
 
-    prec, rec, _ = precision_recall_curve(y_test, y_prob)
-    plot_curve(rec, prec, charts / "pr_curve.png", "Precision-Recall Curve", "Recall", "Precision")
+        prec, rec, _ = precision_recall_curve(y_test, y_prob)
+        plot_curve(rec, prec, charts / "pr_curve.png", "Precision-Recall Curve", "Recall", "Precision")
 
     # 10) Persist artifacts
     #   Save the whole pipeline as 'model.joblib' (vectorizer+model together)
